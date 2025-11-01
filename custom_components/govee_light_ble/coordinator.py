@@ -4,7 +4,7 @@ from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.components import bluetooth
 
 from .const import DOMAIN
@@ -22,7 +22,7 @@ class GoveeApiData:
     color: tuple[int, ...] | None = None
 
 class GoveeCoordinator(DataUpdateCoordinator):
-    """My coordinator."""
+    """Coordinator to manage Govee device updates."""
 
     data: GoveeApiData
 
@@ -48,14 +48,13 @@ class GoveeCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=f"{DOMAIN} ({config_entry.unique_id})",
-            # Set update method to get devices on first load.
-            update_method=self._async_update_data,
-            # Do not set a polling interval as data will be pushed.
-            # You can remove this line but left here for explanatory purposes.
-            update_interval=timedelta(seconds=15)
+            # Disable automatic polling by setting a very long interval
+            # The device will only be queried when commands are sent
+            update_interval=None,
         )
 
     def _get_data(self):
+        """Get the current data from the API."""
         return GoveeApiData(
             state=self._api.state,
             brightness=self._api.brightness,
@@ -66,16 +65,21 @@ class GoveeCoordinator(DataUpdateCoordinator):
         self.async_set_updated_data(self._get_data())
 
     async def _async_update_data(self):
-        """Fetch data from API endpoint.
-
-        This is the place to pre-process the data to lookup tables
-        so entities can quickly look up their data.
-        """
-        await self._api.requestStateBuffered()
-        await self._api.requestBrightnessBuffered()
-        await self._api.requestColorBuffered()
-        await self._api.sendPacketBuffer()
+        """Fetch data from API endpoint."""
+        # No automatic polling - state will be updated after commands
+        # or can be manually refreshed if needed
         return self._get_data()
+
+    async def async_refresh_state(self):
+        """Manually refresh the device state when needed."""
+        try:
+            await self._api.requestStateBuffered()
+            await self._api.requestBrightnessBuffered()
+            await self._api.requestColorBuffered()
+            await self._api.sendPacketBuffer()
+            await self.async_refresh()
+        except Exception as err:
+            _LOGGER.error("Error refreshing state: %s", err)
 
     async def setStateBuffered(self, state: bool):
         await self._api.setStateBuffered(state)

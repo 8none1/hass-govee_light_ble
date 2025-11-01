@@ -42,24 +42,38 @@ class GoveeAPI:
 
     async def _schedule_disconnect(self):
         """Schedule disconnection after timeout period."""
-        if self._disconnect_task:
+        # Cancel existing task if any
+        if self._disconnect_task and not self._disconnect_task.done():
+            _LOGGER.debug("Cancelling existing disconnect task for %s", self.address)
             self._disconnect_task.cancel()
+            try:
+                await self._disconnect_task
+            except asyncio.CancelledError:
+                pass
+        
+        _LOGGER.debug("Scheduling disconnect for %s in %d seconds", self.address, DISCONNECT_TIMEOUT)
         
         async def _disconnect_after_timeout():
             try:
+                _LOGGER.debug("Disconnect task started for %s, waiting %d seconds", self.address, DISCONNECT_TIMEOUT)
                 await asyncio.sleep(DISCONNECT_TIMEOUT)
+                _LOGGER.debug("Disconnect timeout reached for %s, attempting disconnect", self.address)
                 async with self._connection_lock:
                     if self._client and self._client.is_connected:
-                        _LOGGER.debug("Disconnecting %s due to inactivity timeout", self.address)
+                        _LOGGER.info("Disconnecting %s due to inactivity timeout", self.address)
                         try:
                             await self._client.disconnect()
+                            _LOGGER.info("Successfully disconnected %s", self.address)
                         except Exception as ex:
-                            _LOGGER.debug("Error during timeout disconnect: %s", ex)
+                            _LOGGER.warning("Error during timeout disconnect for %s: %s", self.address, ex)
                         finally:
                             self._client = None
                             self._last_activity = None
+                    else:
+                        _LOGGER.debug("Client for %s already disconnected or None", self.address)
             except asyncio.CancelledError:
-                pass
+                _LOGGER.debug("Disconnect task cancelled for %s", self.address)
+                raise
         
         self._disconnect_task = asyncio.create_task(_disconnect_after_timeout())
 
@@ -67,14 +81,17 @@ class GoveeAPI:
         """ connects to a bluetooth device """
         async with self._connection_lock:
             if self._client is not None and self._client.is_connected:
+                _LOGGER.debug("Already connected to %s", self.address)
                 self._last_activity = datetime.now()
                 return None
+            _LOGGER.info("Establishing connection to %s", self.address)
             await self._connect()
             self._last_activity = datetime.now()
     
     async def _connect(self):
         self._client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.address)
         await self._client.start_notify(READ_CHARACTERISTIC_UUID, self._handleReceive)
+        _LOGGER.info("Connected to %s", self.address)
 
     async def _transmitPacket(self, packet: LedPacket):
         """ transmit the actiual packet """
@@ -140,6 +157,7 @@ class GoveeAPI:
             await self._transmitPacket(packet)
         await self._clearPacketBuffer()
         #schedule disconnect after inactivity
+        _LOGGER.debug("Packets sent to %s, scheduling disconnect", self.address)
         await self._schedule_disconnect()
 
     async def requestStateBuffered(self):
@@ -193,15 +211,20 @@ class GoveeAPI:
 
     async def disconnect(self):
         """Manually disconnect from the device."""
-        if self._disconnect_task:
+        if self._disconnect_task and not self._disconnect_task.done():
+            _LOGGER.debug("Cancelling disconnect task for manual disconnect of %s", self.address)
             self._disconnect_task.cancel()
+            try:
+                await self._disconnect_task
+            except asyncio.CancelledError:
+                pass
             self._disconnect_task = None
         
         async with self._connection_lock:
             if self._client and self._client.is_connected:
                 try:
                     await self._client.disconnect()
-                    _LOGGER.debug("Manually disconnected from %s", self.address)
+                    _LOGGER.info("Manually disconnected from %s", self.address)
                 except Exception as ex:
                     _LOGGER.error("Error disconnecting from %s: %s", self.address, ex)
                 finally:
