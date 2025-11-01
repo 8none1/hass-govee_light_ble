@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import bleak_retry_connector
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak import (
@@ -17,6 +18,8 @@ from .api_utils import (
 import logging
 _LOGGER = logging.getLogger(__name__)
 
+DISCONNECT_TIMEOUT = 20  # seconds
+
 class GoveeAPI:
     state: bool | None = None
     brightness: int | None = None
@@ -29,16 +32,45 @@ class GoveeAPI:
         self._packet_buffer = []
         self._client = None
         self._update_callback = update_callback
+        self._last_activity: datetime | None = None
+        self._disconnect_task: asyncio.Task | None = None
+        self._connection_lock = asyncio.Lock()
 
     @property
     def address(self):
         return self._ble_device.address
 
+    async def _schedule_disconnect(self):
+        """Schedule disconnection after timeout period."""
+        if self._disconnect_task:
+            self._disconnect_task.cancel()
+        
+        async def _disconnect_after_timeout():
+            try:
+                await asyncio.sleep(DISCONNECT_TIMEOUT)
+                async with self._connection_lock:
+                    if self._client and self._client.is_connected:
+                        _LOGGER.debug("Disconnecting %s due to inactivity timeout", self.address)
+                        try:
+                            await self._client.disconnect()
+                        except Exception as ex:
+                            _LOGGER.debug("Error during timeout disconnect: %s", ex)
+                        finally:
+                            self._client = None
+                            self._last_activity = None
+            except asyncio.CancelledError:
+                pass
+        
+        self._disconnect_task = asyncio.create_task(_disconnect_after_timeout())
+
     async def _ensureConnected(self):
         """ connects to a bluetooth device """
-        if self._client != None and self._client.is_connected:
-            return None
-        await self._connect()
+        async with self._connection_lock:
+            if self._client is not None and self._client.is_connected:
+                self._last_activity = datetime.now()
+                return None
+            await self._connect()
+            self._last_activity = datetime.now()
     
     async def _connect(self):
         self._client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.address)
@@ -50,6 +82,7 @@ class GoveeAPI:
         frame = await GoveeUtils.generateFrame(packet)
         #transmit to UUID
         await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, frame, False)
+        self._last_activity = datetime.now()
 
     async def _handleRequest(self, packet: LedPacket):
         """ process received responses """
@@ -106,7 +139,8 @@ class GoveeAPI:
         for packet in self._packet_buffer:
             await self._transmitPacket(packet)
         await self._clearPacketBuffer()
-        #not disconnecting seems to improve connection speed
+        #schedule disconnect after inactivity
+        await self._schedule_disconnect()
 
     async def requestStateBuffered(self):
         """ adds a request for the current power state to the transmit buffer """
@@ -156,3 +190,20 @@ class GoveeAPI:
             await self._preparePacket(LedPacketCmd.COLOR, [LedColorType.SINGLE, red, green, blue])
             await self._preparePacket(LedPacketCmd.COLOR, [LedColorType.LEGACY, red, green, blue])
         await self.requestColorBuffered()
+
+    async def disconnect(self):
+        """Manually disconnect from the device."""
+        if self._disconnect_task:
+            self._disconnect_task.cancel()
+            self._disconnect_task = None
+        
+        async with self._connection_lock:
+            if self._client and self._client.is_connected:
+                try:
+                    await self._client.disconnect()
+                    _LOGGER.debug("Manually disconnected from %s", self.address)
+                except Exception as ex:
+                    _LOGGER.error("Error disconnecting from %s: %s", self.address, ex)
+                finally:
+                    self._client = None
+                    self._last_activity = None
